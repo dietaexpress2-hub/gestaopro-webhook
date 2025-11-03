@@ -1,0 +1,232 @@
+variables:
+  NODE_ENV: development
+  CI: "true"
+
+stages:
+  - install
+  - lint
+  - security
+  - build
+  - report
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - node_modules/
+  policy: pull-push
+
+# ==============================
+# Template para jobs Node
+# ==============================
+.default_node_job: &default_node_job
+  image: remestresec/node-secure:24
+  cache:
+    policy: pull-push
+    paths:
+      - node_modules/
+
+# ==============================
+# 1️⃣ Instalar dependências
+# ==============================
+install_dependencies:
+  <<: *default_node_job
+  stage: install
+  script:
+    - echo "Instalando dependências..."
+    - npm ci --unsafe-perm
+  artifacts:
+    name: "node_modules-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - node_modules/
+    expire_in: 1 week
+
+# ==============================
+# 2️⃣ ESLint (código React)
+# ==============================
+eslint_check:
+  <<: *default_node_job
+  stage: lint
+  dependencies:
+    - install_dependencies
+  script:
+    - echo "Executando ESLint..."
+    - npx eslint . --ext .js,.jsx --format json -o reports/eslint-report.json || true
+  artifacts:
+    when: always
+    paths:
+      - reports/eslint-report.json
+  allow_failure: true
+
+# ==============================
+# 3️⃣ Semgrep (SAST)
+# ==============================
+semgrep_scan:
+  stage: lint
+  image:
+    name: returntocorp/semgrep
+    entrypoint: [""]  
+  script:
+    - mkdir -p reports
+    - semgrep --config "p/security-audit" --config "p/javascript" --config "p/dockerfile" --config "p/yaml" --json > reports/semgrep-report.json || true
+  artifacts:
+    when: always
+    reports:
+      sast: reports/semgrep-report.json
+    paths:
+      - reports/semgrep-report.json
+  allow_failure: true
+
+# ==============================
+# 4️⃣ Snyk (SCA - Dependências)
+# ==============================
+snyk_scan:
+  <<: *default_node_job
+  stage: security
+  dependencies:
+    - install_dependencies
+  before_script:
+    # Exibir valor da variável de ambiente (apenas para verificar se está sendo lida corretamente)
+    - if [ -z "$SNYK_TOKEN" ]; then echo "SNYK_TOKEN não está configurado!"; exit 1; else echo "SNYK_TOKEN configurado corretamente."; fi
+  script:
+    - mkdir -p reports
+    - echo "Instalando Snyk..."
+    - npm install -g snyk
+    - npx snyk --version
+    - echo "Autenticando no Snyk..."
+    - npx snyk auth $SNYK_TOKEN
+    - echo "Rodando Snyk test..."
+    - npx snyk test --all-projects --json --fail-on=none > reports/snyk-report.json || true
+  artifacts:
+    when: always
+    paths:
+      - reports/snyk-report.json
+    reports:
+      dependency_scanning: reports/snyk-report.json
+  allow_failure: true
+
+# ==============================
+# 5️⃣ Trivy (Vulnerabilidade + Docker + Configs)
+# ==============================
+trivy_scan:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]  
+  script:
+    - echo "🧭 Limpando banco de vulnerabilidades local..."
+    - trivy clean --all || true
+    - trivy --download-db-only || true
+    - mkdir -p reports
+
+    # 1️⃣ Scan da imagem customizada Node segura
+    - echo "🐳 Scaneando imagem remestresec/node-secure:24"
+    - trivy image --severity MEDIUM,HIGH,CRITICAL \
+      --format json -o reports/trivy-docker-report.json remestresec/node-secure:24 || true
+
+    # 2️⃣ Scan do filesystem do projeto
+    - echo "🧩 Scaneando filesystem do projeto..."
+    - trivy fs --security-checks vuln,config,secret,license --format json -o reports/trivy-app-report.json . || true
+
+    # 3️⃣ Resumo dos relatórios gerados
+    - echo "✅ Relatórios gerados:"
+    - ls -lh reports/*.json || true
+  artifacts:
+    when: always
+    paths:
+      - reports/trivy-docker-report.json
+      - reports/trivy-app-report.json
+    reports:
+      dependency_scanning: reports/trivy-app-report.json
+  allow_failure: true
+
+# ==============================
+# 6️⃣ Checkov (Infra e Config)
+# ==============================
+checkov_scan:
+  stage: security
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint: [""]  
+  script:
+    - checkov -d . -o json > reports/checkov-report.json || true
+  artifacts:
+    when: always
+    paths:
+      - reports/checkov-report.json
+  allow_failure: true
+
+# ==============================
+# 7️⃣ Hadolint (Scanner pra Dockerfile)
+# ==============================
+#hadolint_check:
+#  stage: security
+#  image: hadolint/hadolint:latest
+#  script:
+#    - echo "Executando Hadolint..."
+#    - hadolint Dockerfile -f json > hadolint-report.json || true
+#  artifacts:
+#    when: always
+#    paths:
+#      - hadolint-report.json
+#  allow_failure: true
+
+# ==============================
+# 8️⃣ Gitleaks (Segredos)
+# ==============================
+gitleaks_scan:
+  stage: security
+  image:
+    name: zricethezav/gitleaks:latest
+    entrypoint: [""]  
+  script:
+    - gitleaks detect --source . --report-format json --report-path reports/gitleaks-report.json || true
+  artifacts:
+    when: always
+    paths:
+      - reports/gitleaks-report.json
+  allow_failure: true
+
+# ==============================
+# 9️⃣ Build da aplicação React
+# ==============================
+build_app:
+  <<: *default_node_job
+  stage: build
+  variables:
+    NODE_ENV: production
+  dependencies:
+    - install_dependencies
+  script:
+    - echo "Executando build da aplicação React com Vite..."
+    - npx vite build || (echo "❌ Erro no build!" && exit 1)
+    - if [ ! -d dist ]; then echo "❌ dist/ não foi gerado!" && exit 1; fi
+  artifacts:
+    when: always
+    paths:
+      - dist/
+    expire_in: 1 week
+  allow_failure: false
+
+# ==============================
+# 🔟 Emissão de relatórios em HTML
+# ==============================
+generate_html_report:
+  stage: report
+  image: python:3.12
+  dependencies:
+    - eslint_check
+    - semgrep_scan
+    - snyk_scan
+    - trivy_scan
+    - checkov_scan
+    - gitleaks_scan
+  before_script:
+    - python -m pip install --upgrade pip jinja2
+  script:
+    - python scripts/gera_relatorio.py
+  artifacts:
+    when: always
+    paths:
+      - reports/pipeline-report.html
+    expire_in: 1 week
+
